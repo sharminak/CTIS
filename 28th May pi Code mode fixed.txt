@@ -1,0 +1,457 @@
+import sys
+import json
+import time
+import socket
+
+import threading
+import pandas as pd
+import pickle
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# --- Global Variables and Constants ---
+ARDUINO_IP = "192.168.4.1"  # Arduino’s IP (in AP mode)
+POLL_INTERVAL = 3  # seconds between polls
+
+# Load the AI model (assumed to use only 4 features)
+with open('tyre_pressure_model.pkl', 'rb') as file:
+    model = pickle.load(file)
+feature_columns = ['Dy_FR-Tyre', 'Dy_FL-Tyre', 'Dy_BR-Tyre', 'Dy_BL-Tyre','Dy_Prsr_m','Target_Pressure']
+
+
+target_pressure = 0  
+real_pressure_data = {"P1": 0, "P2": 0, "P3": 0, "P4": 0, "P5": 0, "P6": 0}
+
+# Tyre mapping (used when computing per‑tyre commands)
+tyre_map = {
+  "Dy_FR-Tyre":real_pressure_data["P2"],
+  "Dy_FL-Tyre":real_pressure_data["P1"],
+  "Dy_BR-Tyre":real_pressure_data["P4"],
+  "Dy_BL-Tyre":real_pressure_data["P3"],
+  "Dy_Prsr_m":real_pressure_data["P5"],
+  "Target_Pressure":target_pressure
+ 
+}
+
+predicted_keys = {
+    "P1":"ST_FL-Tyre",
+    "P2":"ST_FR-Tyre",
+    "P3":"ST_BL-Tyre",
+    "P4":"ST_BR-Tyre"}
+    
+
+# Global state variables
+real_pressure_data = {"P1": 0, "P2": 0, "P3": 0, "P4": 0, "P5": 0, "P6": 0}
+predicted_pressure_data = {"ST_FR-Tyre": 0, "ST_FL-Tyre": 0, "ST_BR-Tyre": 0, "ST_BL-Tyre": 0}
+
+# These globals may be updated via external POST requests (from your Flutter app)
+
+
+target_pressure = 0   # Only if nonzero do we compute predictions.
+tyre_comb = ""        # e.g. "ALL", "Front_pair", etc.
+mode = "false"
+# "true" means active; "false" means stopped.
+TOLERANCE = 1        # Tolerance for comparing pressures
+
+# --- Functions to Poll Arduino and Update Data ---
+
+
+
+'''def get_sensor_readings_from_arduino():
+    """
+    Opens a TCP connection to Arduino's HTTP server, sends a GET request,
+    and returns the parsed JSON response.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect((ARDUINO_IP, 80))
+            # Send a GET request so that the Arduino does not update its internal mode.
+            request = (
+                "GET /readSensors HTTP/1.1\r\n"
+                f"Host: {ARDUINO_IP}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            )
+            s.sendall(request.encode('utf-8'))
+            response = b""
+            while True:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+
+            # Split HTTP headers from body
+            parts = response.split(b"\r\n\r\n", 1)
+            if len(parts) < 2:
+                print("Invalid HTTP response from Arduino.")
+                sys.stdout.flush()
+                return None
+            body = parts[1].strip()
+            
+            
+            try:
+                body_str = body.decode('utf-8')
+            except Exception as e:
+                body_str = str(body)
+               
+            
+            sys.stdout.flush()
+            data = json.loads(body_str)
+            return data
+    except Exception as e:
+        print("Error retrieving sensor readings from Arduino:", e)
+        sys.stdout.flush()
+        return None'''
+
+def update_real_pressures():
+    """
+    This function sends a POST request (with minimal JSON as the body)
+    to the Arduino’s updateControl endpoint—exactly as when you see the 
+    "Sensor values from Arduino response" printed. It then parses the 
+    returned JSON and updates the global variables: real_pressure_data,
+    mode, tyre_comb, and target_pressure.
+    """
+    global real_pressure_data, mode, tyre_comb, target_pressure
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect((ARDUINO_IP, 80))
+            # Send a POST request with an empty JSON body.
+            body = "{}"
+            request = (
+                "POST / HTTP/1.1\r\n"
+                f"Host: {ARDUINO_IP}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                f"{body}"
+            )
+            s.sendall(request.encode('utf-8'))
+            response = b""
+            while True:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+            parts = response.split(b"\r\n\r\n", 1)
+            if len(parts) < 2:
+                print("Invalid HTTP response from Arduino.")
+                return
+            # Use the body part of the HTTP response
+            body = parts[1].strip()
+            body_str = body.decode('utf-8', errors='replace')
+            print("Sensor values from Arduino response (via POST):", body_str)
+            data = json.loads(body_str)
+            # Update the globals using the keys from the Arduino response.
+            if "mode" in data and data["mode"]:
+                
+                mode = data["mode"]
+            if "tyre_comb" in data and data["tyre_comb"]:
+                tyre_comb = data["tyre_comb"]
+            
+            if "target_pressure" in data and data["target_pressure"]:
+                target_pressure = data["target_pressure"]
+            
+            real_pressure_data["P1"] = float(data.get("P1", 0))
+            real_pressure_data["P2"] = float(data.get("P2", 0))
+            real_pressure_data["P3"] = float(data.get("P3", 0))
+            real_pressure_data["P4"] = float(data.get("P4", 0))
+            real_pressure_data["P5"] = float(data.get("P5", 0))
+            real_pressure_data["P6"] = float(data.get("P6", 0))
+            print("Updated real_pressure_data:", real_pressure_data)
+    except Exception as e:
+        print("Error in update_real_pressures using POST:", e)
+
+
+def update_predicted_pressures():
+    """
+    Computes AI predictions only if target_pressure > 0.
+    Maps sensor readings (P1–P4) into the order expected by the model.
+    """
+    global predicted_pressure_data, real_pressure_data,target_pressure
+    if target_pressure > 0:
+        try:
+            tyre_map = {
+          "Dy_FR-Tyre":real_pressure_data["P2"],
+      "Dy_FL-Tyre":real_pressure_data["P1"],
+      "Dy_BR-Tyre":real_pressure_data["P4"],
+      "Dy_BL-Tyre":real_pressure_data["P3"],
+      "Dy_Prsr_m":real_pressure_data["P5"],
+      "Target_Pressure":target_pressure
+ 
+    }
+            
+            df = pd.DataFrame(
+                [tyre_map]
+            
+            )
+            print("Prediction Input Dataframe:\n",df)
+            raw_predictions = model.predict(df)[0]
+            print("Raw model predictions:", raw_predictions)
+            avg_pred = sum(raw_predictions) / len(raw_predictions)
+            offset = target_pressure - avg_pred
+            adjusted_predictions = [pred + offset for pred in raw_predictions]
+            predicted_pressure_data["ST_FR-Tyre"] = adjusted_predictions[0]
+            predicted_pressure_data["ST_FL-Tyre"] = adjusted_predictions[1]
+            predicted_pressure_data["ST_BR-Tyre"] = adjusted_predictions[2]
+            predicted_pressure_data["ST_BL-Tyre"] = adjusted_predictions[3]
+            print("Adjusted predictions:", adjusted_predictions)
+        except Exception as e:
+            print("Error during AI prediction:", e)
+            sys.stdout.flush()
+    else:
+        predicted_pressure_data = {}
+        print("No target pressure provided; skipping AI prediction.")
+        sys.stdout.flush()
+        
+        
+        
+
+def manage_pressure():
+    global mode, tyre_comb, target_pressure
+
+    update_real_pressures()
+    update_predicted_pressures()
+
+    print("Real pressure", real_pressure_data)
+
+    selected_tyres = tyre_map.get(tyre_comb, [])
+    commands = {}
+    
+    if target_pressure > 0 :
+        for tyre in ["P1","P2","P3","P4"]:
+        
+            predicted_static = predicted_pressure_data.get(predicted_keys[tyre],0)
+            current_value = real_pressure_data.get(tyre,0)
+            print(f"{tyre}: Current={current_value},Predicted ={predicted_static}, Target={target_pressure}")
+            
+            if tyre_comb == "FP" and tyre not in ["P1","P2"]:
+                commands[tyre] = "null"
+                continue
+            elif tyre_comb == "BP" and tyre not in ["P3","P4"]:
+                commands[tyre] = "null"
+                continue
+
+
+            if current_value < predicted_static - TOLERANCE:
+           
+                    commands[tyre] = "inflate"
+            elif current_value > predicted_static + TOLERANCE:
+                    commands[tyre] = "deflate"
+            else:
+             
+                    commands[tyre] = "null"
+    else:
+    
+        for tyre in ["P1","P2","P3","P4"]:
+            commands[tyre] = "null"
+        """else:
+            print("Target pressure or tyre selection is invalid. Skipping command generation.")
+        """
+    
+    
+    
+    translated_commands = {
+                "e":commands.get("P2","null"),
+                "f":commands.get("P1","null"),
+                "g":commands.get("P4","null"),
+                "h":commands.get("P3","null"),
+                
+                
+                }
+    # Show what we computed
+    
+    # New logic: check if all tyres stopped
+    if all(cmd == "null" for cmd in translated_commands.values()):
+        print("All tyres matched predicted pressures.Stopping mode.")
+        mode = "false"
+        target_pressure = 0;
+        tyre_comb = ""
+        
+        translated_commands["s"]="false"
+        translated_commands["c"]=""
+        translated_commands["p"]=0
+    else:
+        translated_commands["s"]=mode
+        translated_commands["c"]=tyre_comb
+        translated_commands["p"]=target_pressure
+        
+    print("Computed commands:", translated_commands)
+    
+    send_commands_to_arduino(translated_commands)
+    sys.stdout.flush()
+
+
+
+def send_commands_to_arduino(translated_commands):
+    global mode, tyre_comb, target_pressure
+    """
+    Sends a POST request with computed commands to Arduino.
+    Then extracts the JSON response and prints each sensor value on its own line.
+    Also updates control state variables if the response includes them.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect((ARDUINO_IP, 80))
+            
+            '''translated_commands = {
+                "e":commands.get("P2","null"),
+                "f":commands.get("P1","null"),
+                "g":commands.get("P4","null"),
+                "h":commands.get("P3","null")
+                
+                }'''
+            
+            '''
+            payload={
+                "commands":translated_commands,
+                "mode":mode,
+                "tyre_comb":tyre_comb,
+                "target_pressure":target_pressure}
+            body =json.dumps(payload)
+            '''
+            body = json.dumps({"s":mode,
+                "c": tyre_comb,"p":target_pressure, "e":translated_commands["e"],
+                            "f":translated_commands["f"],"g":translated_commands["g"],"h":translated_commands["h"]   })
+                         
+            request = (
+                "POST /updateControl HTTP/1.1\r\n"
+                f"Host: {ARDUINO_IP}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                f"{body}"
+            )
+            s.sendall(request.encode('utf-8'))
+            response = b""
+            while True:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+            parts = response.split(b"\r\n\r\n", 1)
+            if len(parts) > 1:
+                body_bytes = parts[1].strip()
+                try:
+                    parsed_response = json.loads(body_bytes.decode('utf-8'))
+                    print("Sensor values from Arduino response:")
+                    for key, value in parsed_response.items():
+                        print(f"  {key}: {value}")
+                    '''if "mode" in parsed_response:
+                        temp_mode = parsed_response["mode"]
+                        if temp_mode == "" or str(temp_mode).lower() == "null":
+                            mode = "false"
+                        else:
+                            mode = str(temp_mode)
+                    if "tyre_comb" in parsed_response:
+                        tyre_comb = str(parsed_response["tyre_comb"])
+                    if "target" in parsed_response:
+                        target_pressure = float(parsed_response["target"])'''
+                except Exception as e:
+                    print("Error parsing sensor values from Arduino response:", e)
+            else:
+                print("No sensor values found in Arduino response.")
+            sys.stdout.flush()
+    except Exception as e:
+        print("Error sending commands to Arduino:", e)
+        sys.stdout.flush()
+
+# --- Background Polling Thread ---
+def poll_and_manage():
+    print("Starting poll and manage loop.")
+    sys.stdout.flush()
+    while True:
+        
+        manage_pressure()
+        time.sleep(POLL_INTERVAL)
+
+# --- Minimal HTTP Server to Expose Data (if needed) ---
+class RequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        response = {
+            "real_pressure": real_pressure_data,
+            "predicted_pressure": predicted_pressure_data if target_pressure > 0 else {},
+            "mode": mode,
+            "tyre_comb": tyre_comb,
+
+"target_pressure": target_pressure
+        }
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+        print("Served GET request with current data.")
+        sys.stdout.flush()
+
+    def do_POST(self):
+        global tyre_comb, target_pressure, mode
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        try:
+            data = json.loads(post_data.decode('utf-8'))
+            if self.path == '/start':
+                mode = "true"
+                tyre_comb = data.get("config")
+                target_pressure = float(data.get("pressure", "0"))
+                print(f"START Command received: tyre_comb={tyre_comb}, target_pressure={target_pressure}, mode={mode}")
+            elif self.path == '/stop':
+                mode = "false"
+                print("STOP Command received. Mode set to 'false'.")
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "Received", "mode": mode}).encode('utf-8'))
+                return
+            else:
+                print(f"Unknown POST path: {self.path}")
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "Received", "mode": mode}).encode('utf-8'))
+        except Exception as e:
+            print(f"Error in POST request: {e}")
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+        sys.stdout.flush()
+
+def check_connection(host, timeout=5):
+    try:
+        with socket.create_connection((host, 80), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def start_server():
+    server = HTTPServer(('', 5000), RequestHandler)
+    print("Raspberry Pi server running on port 5000...")
+    sys.stdout.flush()
+    server.serve_forever()
+
+# --- Main ---
+if __name__ == "__main__":
+    while not check_connection(ARDUINO_IP):
+        print("Waiting for Arduino's HTTP server...")
+        sys.stdout.flush()
+        time.sleep(5)
+    print("Connected to Arduino's HTTP server.")
+    sys.stdout.flush()
+
+
+    # Start the background thread to poll Arduino and manage commands
+    poll_thread = threading.Thread(target=poll_and_manage, daemon=True)
+    poll_thread.start()
+
+    # Start the Pi's HTTP server (if external GET/POST is needed)
+    try:
+        start_server()
+    except KeyboardInterrupt:
+        print("Shutting down.")
+        sys.exit(0)
+
+
+
